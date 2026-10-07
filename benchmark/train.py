@@ -1,5 +1,19 @@
 """Training entry point for the RL agent.
 
+Nothing in this module, and nothing in the environment it trains on, may see the optimal
+policy, the dynamic program or the HJB solution. The ground truth is used only in evaluation,
+reporting and tests, and tests/test_benchmark.py asserts that by parsing these two modules.
+Two reward scalings are available and both are functions of model inputs only:
+
+    normalization='vecnormalize'   stable-baselines3 VecNormalize with norm_obs=False and
+                                   norm_reward=True, gamma matching the agent. The running
+                                   statistics are saved next to the model, and evaluation
+                                   loads them with training=False and norm_reward=False.
+    normalization='analytic'       a fixed constant, 1 / (lam * T * d_foc), where d_foc is the
+                                   depth from the fill model's own first-order condition at a
+                                   zero price of inventory risk (see config.analytic_reward_scale)
+    normalization='none'           reward scale of one, for reference
+
 The agent is deliberately kept plain: a stock PPO with a small MLP, the standard
 hyperparameters, one environment per process, and a fixed step budget per seed. Nothing is
 tuned per setting and no setting-specific feature is provided, so the same recipe is applied
@@ -14,7 +28,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from benchmark.config import Setting
+from pathlib import Path
+
+from benchmark.config import Setting, analytic_reward_scale
 
 
 @dataclass
@@ -31,6 +47,8 @@ class TrainingConfig:
     log_std_init: float = -1.0
     noise_free: bool = True
     eval_every: int = 25_000
+    normalization: str = 'vecnormalize'
+    n_envs: int = 1
 
 
 @dataclass
@@ -40,19 +58,22 @@ class TrainingRun:
     history: list = field(default_factory=list)   # (timesteps, mean objective on the eval set)
     wall_time: float = 0.0
     config: TrainingConfig | None = None
+    normalizer: object = None                     # the VecNormalize wrapper, if one was used
+    model_path: str | None = None
 
 
-def train_ppo(setting: Setting, seed: int, j_opt: float, eval_crn=None,
-              config: TrainingConfig | None = None):
+def train_ppo(setting: Setting, seed: int, eval_crn=None, config: TrainingConfig | None = None,
+              save_dir=None):
     """Train one PPO agent and return a TrainingRun.
 
-    j_opt is used only to scale the reward, which leaves the optimal policy unchanged: every
-    policy is a maximiser of any positive multiple of the objective.
+    The signature deliberately has no optimum in it. The reward scale comes from
+    TrainingConfig.normalization, which is either stable-baselines3 reward normalization or a
+    constant derived from the fill model.
     """
     import torch
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
-    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
     from benchmark.envs import MMBenchEnv
     from benchmark.simulator import simulate
@@ -61,10 +82,23 @@ def train_ppo(setting: Setting, seed: int, j_opt: float, eval_crn=None,
     config = config or TrainingConfig()
     torch.set_num_threads(max(1, min(4, (torch.get_num_threads() or 1))))
 
-    scale = 1.0 / abs(j_opt)
-    vec_env = DummyVecEnv([lambda: MMBenchEnv(setting, seed=seed,
-                                              noise_free=config.noise_free,
-                                              reward_scale=scale)])
+    if config.normalization == 'analytic':
+        reward_scale = analytic_reward_scale(setting)
+    elif config.normalization in ('vecnormalize', 'none'):
+        reward_scale = 1.0
+    else:
+        raise ValueError(f'unknown normalization {config.normalization!r}')
+
+    def make_env(rank):
+        return lambda: MMBenchEnv(setting, seed=seed + rank, noise_free=config.noise_free,
+                                  reward_scale=reward_scale)
+
+    vec_env = DummyVecEnv([make_env(rank) for rank in range(config.n_envs)])
+    normalizer = None
+    if config.normalization == 'vecnormalize':
+        normalizer = VecNormalize(vec_env, norm_obs=False, norm_reward=True,
+                                  gamma=config.gamma, clip_obs=10.0, clip_reward=10.0)
+        vec_env = normalizer
     model = PPO('MlpPolicy', vec_env, seed=seed, n_steps=config.n_steps,
                 batch_size=config.batch_size, n_epochs=config.n_epochs,
                 learning_rate=config.learning_rate, gamma=config.gamma,
@@ -79,6 +113,8 @@ def train_ppo(setting: Setting, seed: int, j_opt: float, eval_crn=None,
             self.history = []
 
         def _on_step(self) -> bool:
+            # evaluation only: it reports the objective on held out episodes and never feeds
+            # anything back into the training loop
             if eval_crn is not None and self.num_timesteps % config.eval_every == 0:
                 rollout = simulate(setting, RLPolicy(self.model, setting), eval_crn)
                 self.history.append((int(self.num_timesteps), float(rollout.pnl.mean())))
@@ -92,5 +128,36 @@ def train_ppo(setting: Setting, seed: int, j_opt: float, eval_crn=None,
     if eval_crn is not None and not callback.history:
         rollout = simulate(setting, RLPolicy(model, setting), eval_crn)
         callback.history.append((int(config.total_timesteps), float(rollout.pnl.mean())))
+
+    model_path = None
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        model_path = str(save_dir / f'{setting.name}_seed{seed}.zip')
+        model.save(model_path)
+        if normalizer is not None:
+            normalizer.save(str(save_dir / f'{setting.name}_seed{seed}_vecnormalize.pkl'))
     return TrainingRun(seed=seed, model=model, history=callback.history, wall_time=wall_time,
-                       config=config)
+                       config=config, normalizer=normalizer, model_path=model_path)
+
+
+def load_for_evaluation(model_path, setting: Setting, normalizer_path=None):
+    """Load a saved agent for evaluation: training off, reward normalization off.
+
+    Reward normalization cannot change a deterministic policy's actions, and observation
+    normalization is not used here, but switching both off is the documented recipe and keeps
+    evaluation independent of the training reward's scale.
+    """
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    from benchmark.envs import MMBenchEnv
+    from benchmark.strategies import RLPolicy
+
+    model = PPO.load(model_path, device='cpu')
+    if normalizer_path is not None:
+        normalizer = VecNormalize.load(normalizer_path, venv=DummyVecEnv(
+            [lambda: MMBenchEnv(setting, seed=0)]))
+        normalizer.training = False
+        normalizer.norm_reward = False
+    return RLPolicy(model, setting)

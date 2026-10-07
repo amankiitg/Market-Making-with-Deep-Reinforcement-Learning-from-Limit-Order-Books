@@ -93,20 +93,33 @@ def equity_setting() -> Setting:
 
 
 def credit_setting() -> Setting:
-    """Corporate bond dealer answering client RFQs, logistic hit ratio.
+    """One corporate bond dealer answering client requests for quote, logistic hit ratio.
 
-    Units: the price is quoted per 100 of face value, and one lot is 1mm of face value, so a
-    price move of 1 cent per 100 of face is 100 USD on one lot, i.e.
-    usd_per_price_unit = 1_000_000 / 100 = 10_000 USD per price unit per lot.
+    Units and market calibration
+    ---------------------------
+    One lot is 1mm of face value and the price is quoted per 100 of face, so one price unit
+    (one point) on one lot is 1_000_000 / 100 = 10_000 USD and the reporting scale below is
+    10_000. Modified duration D = 7 gives a DV01 of 700 USD per lot per basis point, and one
+    basis point of spread is therefore 700 / 10_000 = 0.07 price points.
+
+    Worked conversion of the calibration target:
+        inputs:  D = 7, half-spread target = 2.5 bp
+        output:  price half-spread = 7 * 0.00025 * 100 = 0.175 points = 1_750 USD per lot
+    The 0.175 point figure is what the solved optimum quotes at (t = 0, q = 0), and
+    tests/test_benchmark.py asserts it.
+
+    Sources of each number are in parameter_table below. sigma comes from a spread volatility
+    of 4 bp per day, which is ASSUMED, and lam (10 requests per side per day) is ASSUMED. The
+    hit ratio parameters (alpha, beta) are not assumed: they are solved numerically so that
+    the dynamic program's optimal half-spread at (t = 0, q = 0) is 0.175 points and the hit
+    ratio at that depth is 0.30, both matching the stated targets.
     """
-    sigma = 0.25   # price units per day, see the rationale below
-    # gamma is chosen so that one lot held for the whole day costs about twice the spread
-    # earned on one fill: 0.5 * gamma * sigma^2 * T = 2.25 * (spread per fill), where the
-    # spread per fill at the optimal depth is about 0.0139 price units. That puts the
-    # inventory penalty at the same order of magnitude as the revenue it protects, which is
-    # what makes inventory control matter in this setting.
-    gamma = 1.0
-    phi = 0.5 * gamma * sigma ** 2
+    sigma = 0.28        # 4 bp per day times 0.07 points per bp
+    # The risk aversion rule is unchanged: the cost of holding one lot for a full day,
+    # 0.5 * gamma * sigma^2 * T, is about 2.25 times the half-spread earned on one fill at the
+    # optimal depth (0.175 points), so gamma = 2 * 2.25 * 0.175 / sigma^2.
+    phi = 2.25 * 0.175
+    gamma = 2.0 * phi / sigma ** 2
     return Setting(
         name='credit',
         market='one investment grade corporate bond, RFQ dealing, logistic hit ratio',
@@ -114,16 +127,16 @@ def credit_setting() -> Setting:
         sigma=sigma,
         T=1.0,
         n_steps=200,
-        lam=50.0,
-        Q=10,
+        lam=10.0,
+        Q=4,
         gamma=gamma,
         phi=phi,
         a=phi * 1.0,
         fill_kind='logistic',
         k=None,
-        alpha=0.0,
-        beta=100.0,
-        d_max=0.06,
+        alpha=-1.627238,
+        beta=14.140205,
+        d_max=0.7,
         usd_per_price_unit=10_000.0,
         pnl_label='USD',
         price_label='price per 100 of face value',
@@ -134,11 +147,11 @@ def parameter_table(setting: Setting) -> list[dict]:
     """Rows for the README: parameter, value, unit, source or ASSUMED with a rationale."""
     common = [
         dict(parameter='s0', value=setting.s0, unit=setting.price_label,
-             source='equity: Avellaneda and Stoikov (2008); credit: par bond, ASSUMED'),
+             source='equity: Avellaneda and Stoikov (2008). credit: par bond at 100, ASSUMED'),
         dict(parameter='sigma', value=setting.sigma,
              unit='price units per unit time',
-             source=('equity: Avellaneda and Stoikov (2008). credit: ASSUMED, duration about 5 '
-                     'years times a daily yield move of about 5 bp gives 0.25 per 100 of face')),
+             source=('equity: Avellaneda and Stoikov (2008). credit: ASSUMED, a spread '
+                     'volatility of 4 bp per day times 0.07 points per bp gives 0.28 points')),
         dict(parameter='T', value=setting.T, unit='time',
              source='equity: as in the paper. credit: one trading day'),
         dict(parameter='dt', value=setting.dt, unit='time',
@@ -146,45 +159,47 @@ def parameter_table(setting: Setting) -> list[dict]:
         dict(parameter='n_steps', value=setting.n_steps, unit='steps',
              source='T / dt'),
         dict(parameter='lam', value=setting.lam, unit='arrivals per unit time',
-             source=('equity: Avellaneda and Stoikov (2008) A = 140. credit: ASSUMED, 50 '
+             source=('equity: Avellaneda and Stoikov (2008) A = 140. credit: ASSUMED, 10 '
                      'requests per side per day for one liquid investment grade bond')),
         dict(parameter='Q', value=setting.Q, unit='lots',
-             source=('chosen so the bound rarely binds; tests and the README report the '
-                     'fraction of time at the bound')),
-        dict(parameter='gamma', value=setting.gamma, unit='risk aversion',
-             source=('equity: Avellaneda and Stoikov (2008) numerical section. credit: chosen '
-                     'so that 0.5 gamma sigma^2 T, the cost of holding one lot for the whole '
-                     'day, is about 2.25 times the spread earned on one fill; see the class '
-                     'docstring for credit_setting')),
+             source=('chosen so the bound never binds: the optimal policy reaches |q| = 2 at '
+                     'most and spends no measurable time at the bound')),
+        dict(parameter='gamma', value=round(setting.gamma, 4), unit='risk aversion',
+             source=('equity: Avellaneda and Stoikov (2008) numerical section. credit: derived '
+                     'from 0.5 gamma sigma^2 T = 2.25 * 0.175, i.e. holding one lot for a full '
+                     'day costs 2.25 times the half-spread earned on one fill')),
         dict(parameter='phi', value=setting.phi, unit='price per unit time per lot^2',
              source='derived: 0.5 * gamma * sigma^2'),
         dict(parameter='a', value=setting.a, unit='price per lot^2',
              source='derived: phi * T, so ending with q lots costs the same as holding q lots '
                     'for the whole horizon'),
+        dict(parameter='a in bp of spread', value=round(setting.a / 0.07, 2),
+             unit='bp',
+             source='same number expressed per basis point of spread: a / 0.07'),
         dict(parameter='usd_per_price_unit', value=setting.usd_per_price_unit, unit='USD',
              source=('reporting only, it never enters the dynamics. equity: one unit of '
                      'inventory is one share, reported per 100 share lot. credit: one lot is '
                      'one million of face, quoted per 100 of face, so one price unit is 10000 '
                      'USD per lot')),
         dict(parameter='d_max', value=setting.d_max, unit='price units',
-             source='RL action bound. Quoting inside this bound is worth within 0.001 percent of '
-                    'the unbounded optimum (see tests/test_benchmark.py and the README table), '
-                    'and it puts the optimal depth near a third of the action range so that '
-                    'exploration covers the region that matters'),
+             source='RL action bound, chosen inside the band that keeps the optimal depth at '
+                    '(t=0, q=0) between 20 and 50 percent of the range and a bound cost under '
+                    '0.1 percent of the optimum; both are measured, see the README'),
     ]
     if setting.fill_kind == 'exponential':
         common.append(dict(parameter='k', value=setting.k, unit='1 / price',
                            source='Avellaneda and Stoikov (2008)'))
     else:
         common.append(dict(parameter='alpha', value=setting.alpha, unit='dimensionless',
-                           source='ASSUMED, gives a hit ratio of 0.5 at a zero half-spread'))
+                           source=('SOLVED, not assumed: calibrated jointly with beta so that '
+                                   'the dynamic program quotes a 2.5 bp half-spread at '
+                                   '(t=0, q=0) and the hit ratio there is 30 percent. Hit '
+                                   'ratio levels for investment grade RFQ are UNVERIFIED, see '
+                                   'the README')))
         common.append(dict(parameter='beta', value=setting.beta, unit='1 / price unit',
-                           source=('ASSUMED. beta sets the optimal half-spread through the '
-                                   'first order condition beta (1 - f) d = 1, so beta = 100 '
-                                   'puts the optimal half-spread near 1.4 cents per 100 of '
-                                   'face, i.e. 1.4 basis points, with a hit ratio near 0.20, '
-                                   'the order of magnitude reported for liquid investment '
-                                   'grade dealer-to-client RFQ activity')))
+                           source=('SOLVED, not assumed: the slope follows from the first '
+                                   'order condition beta (1 - f) d = 1 once alpha is fixed by '
+                                   'the 30 percent hit ratio target')))
     return common
 
 
@@ -200,6 +215,22 @@ def depths_from_action(setting: 'Setting', action) -> tuple[np.ndarray, np.ndarr
     action = np.asarray(action, dtype=float)
     squashed = setting.d_max / (1.0 + np.exp(-LOGIT_SCALE * action))
     return squashed[..., 0], squashed[..., 1]
+
+
+def analytic_reward_scale(setting: 'Setting') -> float:
+    """A fixed reward scale that uses only model inputs, never the solved optimum.
+
+    The scale is 1 / (lam * T * d_foc), where d_foc is the depth that maximises f(d) d for the
+    fill model, i.e. the first-order condition of the fill model at a zero price of inventory
+    risk. For the exponential model d_foc = 1/k; for the logistic model it solves
+    beta (1 - f(d)) d = 1. Two properties make this a legitimate scale rather than a leak: it
+    depends only on lam, T and the fill model, and it is the same for both settings by
+    construction. Multiplying a reward by a positive constant leaves every optimal policy
+    unchanged, so it affects learning only through the size of the critic's targets, which is
+    the whole point: without it the critic regresses returns of order fifty.
+    """
+    d_foc = float(setting.fill_model().optimal_depth(0.0))
+    return 1.0 / (setting.lam * setting.T * d_foc)
 
 
 def zero_inventory_depths(setting: Setting, h_result) -> tuple[float, float]:
