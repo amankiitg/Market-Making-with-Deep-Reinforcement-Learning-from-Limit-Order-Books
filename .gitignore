@@ -1,0 +1,13 @@
+# Datasets, raw exchange dumps and model checkpoints are not distributed with this
+# repository, see the "Data" section of README.md.
+/data/*/
+/raw/
+/ckpt/
+/log/
+/results/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/

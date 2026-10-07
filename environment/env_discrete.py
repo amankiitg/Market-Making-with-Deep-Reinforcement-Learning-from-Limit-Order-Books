@@ -9,6 +9,7 @@ from .env_feature import EnvFeature
 from .base_env import TRADE_UNIT
 
 from utils import day2date, lob_norm
+from state_spec import active_state_keys, state_specs
 
 class EnvDiscrete(EnvFeature):
     """
@@ -28,6 +29,12 @@ class EnvDiscrete(EnvFeature):
             wo_dampened_pnl=False,
             wo_matched_pnl=False,
             wo_inv_punish=False,
+            # reward definition
+            reward_mode='composite',
+            inventory_penalty=0.01,
+            asymmetry_eta=0.5,
+            # action space
+            num_actions=8,
             **kwargs
         ):
         super().__init__(**kwargs)
@@ -46,9 +53,21 @@ class EnvDiscrete(EnvFeature):
         self.r_ma = 0 if wo_matched_pnl else 1
         self.r_ip = 0 if wo_inv_punish else 1
 
-        # Inventory punishment factor
-        self.theta = 0.01
-        self.eta = 0.5
+        self.reward_mode = reward_mode
+        # Inventory punishment factor zeta, paper Eq. (15) and section IV-C2.
+        self.theta = inventory_penalty
+        # Asymmetry factor eta, paper Eq. (13) and section IV-C2.
+        self.eta = asymmetry_eta
+
+        # Paper section III-C1 defines 8 discrete actions, 0..7, where action 7 closes the
+        # position with market orders. action2order below implements exactly those 8, so a
+        # smaller value silently removes the flatten action from the action space.
+        if not 1 <= num_actions <= 8:
+            raise ValueError(
+                f'num_actions must be between 1 and 8 (implemented actions are 0..7), '
+                f'got {num_actions}'
+            )
+        self.num_actions = num_actions
 
         self.init_states()
 
@@ -58,36 +77,38 @@ class EnvDiscrete(EnvFeature):
         self.load_msg(code=code, day=day)
 
     def init_states(self):
-        self.__states_space__ = dict()
-        if not self.wo_lob_state:
-            self.__states_space__['lob_state'] = dict(
-                type='float',
-                shape=(self.T,40,1)
-                )
-        if not self.wo_market_state:
-            self.__states_space__['market_state'] = dict(
-                type='float',
-                shape=(24,)
-                )
-        if not self.wo_agent_state:
-            self.__states_space__['agent_state'] = dict(
-                type='float',
-                shape=(24,)
-                )
-            
+        self.state_keys = active_state_keys(
+            wo_lob_state=self.wo_lob_state,
+            wo_market_state=self.wo_market_state,
+            wo_agent_state=self.wo_agent_state,
+        )
+        self.__states_space__ = state_specs(self.T, keys=self.state_keys)
+
     def states(self):
         return self.__states_space__
 
     def actions(self):
         return dict(
                     type='int',
-                    num_values=5
+                    num_values=self.num_actions
                 )
     
     def max_episode_timesteps(self):
         return self.__max_episode_timesteps__
 
     def action2order(self, actions):
+        """Map a discrete action to a bid/ask quote pair (paper section III-C1).
+
+        Actions 0..6 place a symmetric limit pair on the 0.01 yuan tick grid, widening the
+        pair as the index grows (level 0 at the touch, level 2 two ticks deep). Action 7
+        sends market orders that flatten the current inventory. Volume is TRADE_UNIT (100
+        shares) per side.
+
+        Timing convention (unified with `match` and `get_price_info`): at decision step `i`
+        the agent may only use information up to `t_1 = self.i - self.latency`; the quotes
+        below are placed on `t_1` reference prices and `match` fills them against the trades
+        in `(t_1, i]`. See EnvContinuous.action2order for a worked latency example.
+        """
         # t-latency
         t_1_mid_price, t_1_a1_price, t_1_b1_price, t_1_spread = self.get_price_info(self.i-self.latency)
 
@@ -145,21 +166,44 @@ class EnvDiscrete(EnvFeature):
         return orders
 
     def get_reward(self, trade_price, trade_volume):
+        """Reward for one environment step, see EnvContinuous.get_reward for the equations.
+
+        reward_mode='composite' is the paper's reward, Eq. (12)-(16) in section III-D, with
+        the inventory punishment in its L2 form IP = theta * (inventory / TRADE_UNIT) ** 2
+        (paper Eq. (15)). The shipped discrete env used an L1 form on the inventory change,
+        but that line was commented out, so nothing that was actually active is lost.
+
+        reward_mode='pnl' reproduces the shipped code path: reward = DeltaPnL.
+        """
         pnl = self.value - self.value_
 
-        # Asymmetrically dampened PnL
+        # Asymmetrically dampened PnL, paper Eq. (13)
         asymmetric_dampen = max(0, self.eta * pnl)
         dampened_pnl = pnl - asymmetric_dampen
 
+        # Matched (trading) PnL, paper Eq. (14)
         matched_pnl = (self.mid_price - trade_price) * trade_volume
 
-        delta_inventory = abs(self.inventory) - abs(self.inventory_)
-        # delta_inventory = max(0, delta_inventory)
+        # Inventory punishment, paper Eq. (15)
+        inventory_punishment = self.theta * (self.inventory/TRADE_UNIT)**2
 
-        inventory_punishment = self.theta * (delta_inventory/TRADE_UNIT)
-        # inventory_punishment = self.theta * (self.inventory/TRADE_UNIT)**2
-        reward = pnl
-        # reward = self.r_ma * matched_pnl + self.r_da * dampened_pnl - self.r_ip * inventory_punishment
+        if self.reward_mode == 'composite':
+            reward = (self.r_ma * matched_pnl
+                      + self.r_da * dampened_pnl
+                      - self.r_ip * inventory_punishment)
+        elif self.reward_mode == 'pnl':
+            reward = pnl
+        else:
+            raise ValueError(
+                f"reward_mode must be 'composite' or 'pnl', got {self.reward_mode!r}"
+            )
+
+        # Reward components, surfaced in get_final_result for PnL attribution.
+        self.reward_dampened_pnl = dampened_pnl
+        self.reward_trading_pnl = matched_pnl
+        self.reward_inventory_punishment = inventory_punishment
+        self.reward_spread_punishment = 0
+
         self.value_ = self.value
 
         return reward
@@ -167,16 +211,16 @@ class EnvDiscrete(EnvFeature):
     def get_state_at_t(self, t):
         self.__state__ = dict()
 
-        if not self.wo_lob_state:
-            lob = self.episode_state.iloc[t-self.T:t]
-            mid_price = (lob.ask1_price + lob.bid1_price)/2
-            lob_normed = lob_norm(lob, mid_price)
-            self.__state__['lob_state'] = np.expand_dims(np.array(lob_normed), -1)
-
-        if not self.wo_market_state:
-            self.__state__['market_state'] = self._get_market_state(t) + self._get_order_strength_index(t)
-
-        if not self.wo_agent_state:
-            self.__state__['agent_state'] = [self.inventory/(10*TRADE_UNIT)]*12 + [t / self.episode_length]*12
+        # Built in canonical state order, see state_spec.STATE_KEYS.
+        for key in self.state_keys:
+            if key == 'lob_state':
+                lob = self.episode_state.iloc[t-self.T:t]
+                mid_price = (lob.ask1_price + lob.bid1_price)/2
+                lob_normed = lob_norm(lob, mid_price)
+                self.__state__['lob_state'] = np.expand_dims(np.array(lob_normed), -1)
+            elif key == 'market_state':
+                self.__state__['market_state'] = self._get_market_state(t) + self._get_order_strength_index(t)
+            elif key == 'agent_state':
+                self.__state__['agent_state'] = [self.inventory/(10*TRADE_UNIT)]*12 + [t / self.episode_length]*12
 
         return self.__state__
