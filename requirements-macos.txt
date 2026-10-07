@@ -1,0 +1,45 @@
+# Requirements for macOS Apple Silicon (arm64).
+#
+# Why this file exists: the original conda_setup.yaml is a linux-64 / CUDA export and cannot
+# be recreated on Apple Silicon. tensorflow 2.6.0 has no arm64 wheel, and tensorforce 0.6.5
+# declares `tensorflow==2.6.0`, `numpy==1.19.5`, `h5py~=3.1.0` as hard requirements, so a
+# normal `pip install tensorforce==0.6.5` cannot resolve here at all. We therefore install
+# the verified combination below and add tensorforce with --no-deps.
+#
+# INSTALL ORDER (exact commands, from a clean checkout):
+#
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install --upgrade pip
+#   pip install -r requirements-macos.txt
+#   pip install --no-deps tensorforce==0.6.5
+#   pip install pytest==9.1.1
+#   python -c "import tensorflow, tensorforce; print(tensorflow.__version__, tensorforce.__version__)"
+#
+# Expected last line: 2.11.0 0.6.5
+#
+# Notes
+#   * numpy must stay below 2. TensorFlow 2.11 aborts at import with
+#     "TypeError: Unable to convert function return value to a Python type" under numpy 2.x.
+#   * `pip check` will report tensorforce 0.6.5 as unsatisfied (it wants tensorflow==2.6.0,
+#     numpy==1.19.5, h5py~=3.1.0). That is expected and harmless: the only private TensorFlow
+#     APIs it uses are the Keras optimizer internals patched in compat.py.
+#   * gym, matplotlib and Pillow are declared by tensorforce but not needed by this project
+#     (gym is imported lazily only for gym environments, and matplotlib/Pillow only for
+#     visualisation). They are omitted on purpose.
+#   * tensorflow-metal is optional and only speeds up training on Apple GPUs.
+#   * For the faithful Linux x86_64 stack (tensorflow 2.6.0) use the Dockerfile instead.
+
+tensorflow-macos==2.11.0
+keras==2.11.0
+numpy==1.26.4
+pandas==2.3.3
+h5py==3.16.0
+tqdm==4.70.1
+# tensorforce uses msgpack-numpy for agent.save(..., format='numpy')
+msgpack==1.2.3
+msgpack-numpy==0.4.8
+# pyrallis dependencies
+pyrallis==0.3.1
+typing-inspect==0.9.0
+PyYAML==6.0.3

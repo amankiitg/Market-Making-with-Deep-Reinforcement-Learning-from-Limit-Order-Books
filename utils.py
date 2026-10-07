@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import math
 
+from state_spec import LOB_COLUMNS
+
 def min_max_norm(data):
     minVals = data.min()
     maxVals = data.max()
@@ -17,13 +19,24 @@ def z_norm(data):
 
 def lob_norm(data_, midprice):
     data = data_.copy()
+    missing = [column for column in LOB_COLUMNS if column not in data.columns]
+    if missing:
+        raise KeyError(
+            f'order book frame is missing {len(missing)} expected column(s), first few: '
+            f'{missing[:5]}. See state_spec.LOB_COLUMNS for the canonical channel order.'
+        )
+    # Fix the channel order so the RL state and the pretrained encoder agree, see
+    # state_spec.LOB_COLUMNS. Extra columns are dropped on purpose.
+    data = data[list(LOB_COLUMNS)]
     for i in range(10):
         data[f'ask{i+1}_price'] = data[f'ask{i+1}_price']/(midprice+1e-7) - 1
         data[f'bid{i+1}_price'] = data[f'bid{i+1}_price']/(midprice+1e-7) - 1
         # data[f'ask{i+1}_price'] = z_norm(data[f'ask{i+1}_price'])
         # data[f'bid{i+1}_price'] = z_norm(data[f'bid{i+1}_price'])
-        data[f'ask{i+1}_volume'] = data[f'ask{i+1}_volume']/data[f'ask{i+1}_volume'].max()
-        data[f'bid{i+1}_volume'] = data[f'bid{i+1}_volume']/data[f'bid{i+1}_volume'].max()
+        # +1e-7 keeps an all-zero volume level from producing inf/nan, which TensorForce
+        # rejects outright (its tensor checks assert finite values).
+        data[f'ask{i+1}_volume'] = data[f'ask{i+1}_volume']/(data[f'ask{i+1}_volume'].max()+1e-7)
+        data[f'bid{i+1}_volume'] = data[f'bid{i+1}_volume']/(data[f'bid{i+1}_volume'].max()+1e-7)
 
     return data
 
@@ -50,14 +63,14 @@ def pd_is_equal(state_1, state_2):
     tmp_2 = state_2.iloc[:,1:]
     return tmp_1.equals(tmp_2)
 
-def load_data(code, datelist, horizon=10):
+def load_data(code, datelist, horizon=10, data_dir='data'):
     if type(datelist) is str:
         datelist = [datelist]
     data_list = []
     for day in datelist:
-        ask = pd.read_csv(f"data/{code}/{day}/ask.csv")
-        bid = pd.read_csv(f"data/{code}/{day}/bid.csv").drop(['timestamp'], axis = 1)
-        price = pd.read_csv(f"data/{code}/{day}/price.csv").drop(['timestamp', 'ask1_price', 'bid1_price'], axis = 1)
+        ask = pd.read_csv(f"{data_dir}/{code}/{day}/ask.csv")
+        bid = pd.read_csv(f"{data_dir}/{code}/{day}/bid.csv").drop(['timestamp'], axis = 1)
+        price = pd.read_csv(f"{data_dir}/{code}/{day}/price.csv").drop(['timestamp', 'ask1_price', 'bid1_price'], axis = 1)
         data = pd.concat([ask, bid, price], axis=1)
         data['date'] = data['timestamp'].str.split(expand=True)[0]
         data['time'] = data['timestamp'].str.split(expand=True)[1]
@@ -91,8 +104,10 @@ def process_data(data):
         data[f'bid{i+1}_price'] = data[f'bid{i+1}_price']/data['midprice'] - 1
         # data[f'ask{i+1}_price'] = z_norm(data[f'ask{i+1}_price'])
         # data[f'bid{i+1}_price'] = z_norm(data[f'bid{i+1}_price'])
-        data[f'ask{i+1}_volume'] = data[f'ask{i+1}_volume']/data[f'ask{i+1}_volume'].max()
-        data[f'bid{i+1}_volume'] = data[f'bid{i+1}_volume']/data[f'bid{i+1}_volume'].max()
+        # +1e-7 keeps an all-zero volume level from producing inf/nan, which TensorForce
+        # rejects outright (its tensor checks assert finite values).
+        data[f'ask{i+1}_volume'] = data[f'ask{i+1}_volume']/(data[f'ask{i+1}_volume'].max()+1e-7)
+        data[f'bid{i+1}_volume'] = data[f'bid{i+1}_volume']/(data[f'bid{i+1}_volume'].max()+1e-7)
 
     return data.set_index(['date', 'time'])
 
