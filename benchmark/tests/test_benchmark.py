@@ -4,7 +4,9 @@ claims to measure.
 Everything here is cheap except the RL tests, which are marked slow and train a short budget.
 """
 
+import ast
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -21,6 +23,62 @@ SETTERS = [equity_setting, credit_setting]
 
 def _naive_grid(setting):
     return np.linspace(0.02 * setting.d_max, setting.d_max, 13)
+
+
+def test_training_cannot_see_the_optimum():
+    """The trainer and the environment must not import or name the solver or the dynamic
+    program. The ground truth is allowed in evaluation, reporting and tests only."""
+    banned_modules = ('benchmark.dp', 'benchmark.hjb')
+    banned_names = ('solve_dp', 'solve_hjb', 'optimal_value', 'closed_form_exponential',
+                    'j_opt', 'j_star', 'dsolution')
+    for relative in ('benchmark/train.py', 'benchmark/envs.py'):
+        source = Path(relative).read_text()
+        tree = ast.parse(source)
+        modules = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules.append(node.module)
+            elif isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+        offending = [m for m in modules if m.startswith(banned_modules)]
+        assert not offending, f'{relative} imports {offending}'
+        found = [name for name in banned_names if name in source]
+        assert not found, f'{relative} mentions {found}, which belongs to evaluation only'
+
+
+def test_credit_calibration_hits_its_stated_targets():
+    """The credit market is calibrated in spread terms: a 2.5 basis point half-spread and a
+    30 percent hit ratio at (t = 0, q = 0), both as solved by the dynamic program."""
+    setting = credit_setting()
+    dp = solve_dp(setting)
+    d0 = float(dp.d_ask[0, setting.Q])
+    hit = float(setting.fill_model().f(d0))
+    assert d0 == pytest.approx(0.175, rel=0.20), f'half-spread at (0,0) is {d0:.4f} points'
+    assert hit == pytest.approx(0.30, abs=0.05), f'hit ratio at the optimum is {hit:.3f}'
+    # 1 basis point of spread is 0.07 price points at a DV01 of 700 USD per lot
+    assert d0 / 0.07 == pytest.approx(2.5, rel=0.20)
+    assert setting.sigma == pytest.approx(4 * 0.07)
+    assert 0.5 * setting.gamma * setting.sigma ** 2 * setting.T == pytest.approx(2.25 * d0,
+                                                                               rel=0.05)
+
+
+def test_credit_inventory_limit_and_action_bound_rules():
+    """Q must never bind and the action bound must cost under 0.1 percent of the optimum while
+    leaving the optimal depth between 20 and 50 percent of the range."""
+    setting = credit_setting()
+    dp = solve_dp(setting)
+    d0 = float(dp.d_ask[0, setting.Q])
+    assert 0.20 <= d0 / setting.d_max <= 0.50, f'depth is {d0 / setting.d_max:.3f} of the range'
+    wide = solve_dp(replace(setting, d_max=4.0 * setting.d_max))
+    loss = wide.optimal_value - dp.optimal_value
+    assert loss >= 0.0
+    assert loss < 1e-3 * abs(wide.optimal_value), (
+        f'the bound costs {100 * loss / abs(wide.optimal_value):.4f} percent of the optimum'
+    )
+    crn = held_out_crn(setting, n_episodes=400)
+    from benchmark.strategies import dp_policy
+    rollout = simulate(setting, dp_policy(dp, setting), crn)
+    assert np.abs(rollout.terminal_q).max() < setting.Q, 'the optimal policy must not reach Q'
 
 
 @pytest.mark.parametrize('setter', SETTERS)
@@ -61,9 +119,10 @@ def test_efficiency_of_the_exact_policies_is_one(setter):
     within sampling error. This is the end to end calibration check of the headline metric."""
     setting = setter()
     crn = held_out_crn(setting, n_episodes=3000)
+    naive_depth, _ = tune_constant_depth(setting, _naive_grid(setting))
     policies = {'dp_optimal': dp_policy(solve_dp(setting), setting),
                 'hjb_optimal': hjb_policy(setting),
-                'naive_tuned': ConstantPolicy(setting, 0.5 * setting.d_max)}
+                'naive_tuned': ConstantPolicy(setting, naive_depth)}
     reports = evaluate(setting, policies, crn)
     j_opt = solve_dp(setting).optimal_value
     j_naive = reports['naive_tuned'].mean
@@ -129,14 +188,15 @@ def test_paired_difference_detects_a_known_offset():
 @pytest.mark.slow
 @pytest.mark.parametrize('setter,timesteps,threshold', [
     (equity_setting, 100_000, 0.60),
-    (credit_setting, 300_000, 0.40),
+    (credit_setting, 300_000, 0.35),
 ])
 def test_rl_reaches_a_large_share_of_the_optimum(setter, timesteps, threshold):
     """A short training run must capture a substantial share of the distance from a deep fixed
-    quote to the exact optimum. The budgets and thresholds are deliberately well below what
-    benchmark/run_all.py achieves (0.836 for equity and 0.812 for credit over five seeds at
-    500k steps); the point here is to catch a broken environment, reward or action mapping, not
-    to measure final performance."""
+    quote to the exact optimum. The thresholds are about 70 percent of the 5-seed mean that
+    benchmark/run_all.py measured at 500k steps (0.910 for equity, 0.566 for credit), rounded
+    down to the nearest 0.05, and the budgets here are shorter than the full run, so the point
+    is to catch a broken environment, reward or action mapping, not to measure final
+    performance."""
     from benchmark.strategies import RLPolicy
     from benchmark.train import TrainingConfig, train_ppo
 
@@ -145,7 +205,7 @@ def test_rl_reaches_a_large_share_of_the_optimum(setter, timesteps, threshold):
     crn = held_out_crn(setting, n_episodes=1000)
     deep = evaluate(setting, {'constant_deep': ConstantPolicy(setting, setting.d_max)}, crn)
     config = TrainingConfig(total_timesteps=timesteps, eval_every=timesteps)
-    run = train_ppo(setting, 0, j_opt, eval_crn=crn, config=config)
+    run = train_ppo(setting, 0, eval_crn=crn, config=config)
     rl = evaluate(setting, {'rl': RLPolicy(run.model, setting)}, crn)['rl']
     score = efficiency(rl.mean, deep['constant_deep'].mean, j_opt)
     assert score > threshold, (

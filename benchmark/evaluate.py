@@ -92,6 +92,39 @@ def efficiency(j_strategy: float, j_naive: float, j_opt: float) -> float:
     return (j_strategy - j_naive) / denominator
 
 
+def seed_dispersion(per_seed_objectives, j_naive: float, j_opt: float) -> dict:
+    """Efficiency per training seed, with the spread across seeds.
+
+    Every seed is evaluated on the same held out episodes, so the spread is training variation
+    rather than evaluation noise. The worst and best seeds are reported alongside the mean
+    because a single lucky seed is not a result.
+    """
+    objectives = [float(v) for v in per_seed_objectives]
+    efficiencies = np.asarray([efficiency(v, j_naive, j_opt) for v in objectives], dtype=float)
+    return {'per_seed_objective': objectives,
+            'per_seed_efficiency': efficiencies.tolist(),
+            'mean_efficiency': float(efficiencies.mean()),
+            'std_efficiency': float(efficiencies.std(ddof=1)) if efficiencies.size > 1 else 0.0,
+            'worst_seed_efficiency': float(efficiencies.min()),
+            'best_seed_efficiency': float(efficiencies.max()),
+            'n_seeds': int(efficiencies.size)}
+
+
+def headline_sentence(dispersion: dict) -> str:
+    """The one line summary in the format the project brief asks for."""
+    return (f"PPO recovers {100 * dispersion['mean_efficiency']:.1f}% "
+            f"+/- {100 * dispersion['std_efficiency']:.1f}% "
+            f"(worst seed {100 * dispersion['worst_seed_efficiency']:.1f}%) of the optimal "
+            f"policy's improvement over a tuned constant quote.")
+
+
+def tuned_quote_earns_nothing(reports: dict, naive_name: str = 'naive_tuned') -> bool:
+    """True when the tuned constant quote's mean is within its own 95 percent interval of zero."""
+    report = reports[naive_name]
+    half_width = 1.959963984540054 * report.se
+    return abs(report.mean) <= half_width
+
+
 def paired_difference(a: StrategyReport, b: StrategyReport) -> dict:
     """Paired comparison of two strategies evaluated on the same episodes."""
     diff = a.pnl - b.pnl
@@ -132,6 +165,7 @@ def build_summary(setting: Setting, reports: dict[str, StrategyReport], j_opt: f
     return {'setting': setting.name,
             'j_opt_discrete': j_opt,
             'j_naive_tuned': naive,
+            'j_naive_ci95_half_width': 1.959963984540054 * reports[naive_name].se,
             'pnl_scale': pnl_scale,
             'rows': rows,
             'paired': [paired_difference(reports[name], reports['dp_optimal'])

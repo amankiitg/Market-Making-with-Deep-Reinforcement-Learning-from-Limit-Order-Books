@@ -17,14 +17,17 @@ import numpy as np
 
 from benchmark.config import Setting, credit_setting, equity_setting, parameter_table
 from benchmark.dp import solve_dp
-from benchmark.evaluate import (StrategyReport, build_summary, evaluate, format_summary_table,
-                               held_out_crn, tune_constant_depth)
+from benchmark.evaluate import (TEST_SEED, StrategyReport, build_summary, evaluate,
+                               format_summary_table, headline_sentence, held_out_crn,
+                               seed_dispersion, tune_constant_depth, tuned_quote_earns_nothing)
 from benchmark.figures import (plot_efficiency_bars, plot_inventory_histograms,
                                plot_learning_curves, plot_policy_depths, plot_sample_path)
+from benchmark.simulator import make_crn
 from benchmark.strategies import (ASHeuristicPolicy, ConstantPolicy, RLPolicy,
                                  TablePolicy, closed_form_policy, dp_policy, hjb_policy)
 
 RESULTS = Path(__file__).resolve().parent / 'results'
+MODELS = Path(__file__).resolve().parent / 'models'
 RL_SEEDS = (0, 1, 2, 3, 4)
 
 
@@ -61,7 +64,8 @@ def build_policies(setting: Setting, dp, hjb: TablePolicy, naive_depth: float) -
 
 def run_setting(setting: Setting, timesteps: int, seeds, n_test: int, train: bool,
                 noise_free: bool = True, figures: bool = True, verbose: bool = True,
-                figure_tag: str = '') -> dict:
+                figure_tag: str = '', normalization: str = 'vecnormalize',
+                save_models: bool = False) -> dict:
     started = time.time()
     dp = solve_dp(setting)
     j_opt = dp.optimal_value
@@ -72,26 +76,39 @@ def run_setting(setting: Setting, timesteps: int, seeds, n_test: int, train: boo
     reports = evaluate(setting, policies, crn)
 
     runs = []
+    dispersion = None
     if train:
         from benchmark.train import TrainingConfig, train_ppo
 
-        config = TrainingConfig(total_timesteps=timesteps, noise_free=noise_free)
+        # the callback only draws the learning curve, so it uses a small episode set; the
+        # headline numbers come from the full held out set at the end
+        curve_crn = make_crn(setting, 500, seed=TEST_SEED + 7)
+        config = TrainingConfig(total_timesteps=timesteps, noise_free=noise_free,
+                                normalization=normalization,
+                                eval_every=max(25_000, timesteps // 8))
+        save_dir = MODELS / setting.name if save_models else None
         for seed in seeds:
-            run = train_ppo(setting, seed, j_opt, eval_crn=crn, config=config)
+            run = train_ppo(setting, seed, eval_crn=curve_crn, config=config,
+                            save_dir=save_dir)
             runs.append(run)
             if verbose:
-                print(f'  [{setting.name}] seed {seed}: {run.wall_time:5.1f}s, '
-                      f'held out objective {run.history[-1][1]:.4f} '
-                      f'(optimum {j_opt:.4f})', flush=True)
+                print(f'  [{setting.name}] seed {seed}: {run.wall_time:5.1f}s', flush=True)
         per_seed = [evaluate(setting, {'rl': RLPolicy(run.model, setting)}, crn)['rl']
                     for run in runs]
         # the RL entry is the mixture over seeds, so its per-episode values are the seed mean
         stacked = np.mean([report.pnl for report in per_seed], axis=0)
         reports['rl'] = StrategyReport(name='rl',
                                        rollout=_with_pnl(per_seed[0].rollout, stacked))
-        if len(runs) > 1:
-            reports['rl_worst_seed'] = StrategyReport(
-                name='rl_worst_seed', rollout=min(per_seed, key=lambda r: r.pnl.mean()).rollout)
+        dispersion = seed_dispersion([report.mean for report in per_seed],
+                                     reports['naive_tuned'].mean, j_opt)
+        if verbose:
+            print(f'  [{setting.name}] 5-seed efficiency {dispersion["mean_efficiency"]:.3f} '
+                  f'+- {dispersion["std_efficiency"]:.3f}, worst '
+                  f'{dispersion["worst_seed_efficiency"]:.3f}', flush=True)
+        worst = min(per_seed, key=lambda r: r.pnl.mean())
+        best = max(per_seed, key=lambda r: r.pnl.mean())
+        reports['rl_worst_seed'] = StrategyReport(name='rl_worst_seed', rollout=worst.rollout)
+        reports['rl_best_seed'] = StrategyReport(name='rl_best_seed', rollout=best.rollout)
 
     summary = build_summary(setting, reports, j_opt, naive_name='naive_tuned',
                             pnl_scale=setting.usd_per_price_unit)
@@ -102,6 +119,12 @@ def run_setting(setting: Setting, timesteps: int, seeds, n_test: int, train: boo
     summary['rl_seed_objectives'] = [float(r.history[-1][1]) for r in runs]
     summary['rl_seed_wall_times'] = [float(r.wall_time) for r in runs]
     summary['rl_histories'] = [[[int(s), float(v)] for s, v in r.history] for r in runs]
+    summary['reward_normalization'] = normalization
+    summary['rl_model_paths'] = [r.model_path for r in runs]
+    if dispersion is not None:
+        summary['seed_dispersion'] = dispersion
+        summary['headline'] = headline_sentence(dispersion)
+    summary['tuned_quote_earns_nothing'] = bool(tuned_quote_earns_nothing(reports))
 
     if figures:
         paths = []
@@ -141,6 +164,20 @@ def main(argv=None) -> int:
     parser.add_argument('--seeds', type=int, default=len(RL_SEEDS))
     parser.add_argument('--episodes', type=int, default=2000)
     parser.add_argument('--no-train', action='store_true')
+    parser.add_argument('--normalization', default='vecnormalize',
+                        choices=['vecnormalize', 'analytic', 'none'],
+                        help='reward scaling used in training, see benchmark/train.py')
+    parser.add_argument('--normalization-credit', default=None,
+                        choices=['vecnormalize', 'analytic', 'none'],
+                        help='override the reward scaling for the credit setting only')
+    parser.add_argument('--only', default='both', choices=['both', 'equity', 'credit'],
+                        help='run a single setting, used for the normalization comparison')
+    parser.add_argument('--figure-tag', default='',
+                        help='suffix for figure file names, so a comparison run cannot '
+                             'overwrite the canonical figures')
+    parser.add_argument('--save-models', action='store_true',
+                        help='write trained agents and the reward normalization statistics to '
+                             'benchmark/models/')
     parser.add_argument('--quick', action='store_true',
                         help='fast smoke run: few steps, few episodes, one seed')
     parser.add_argument('--ablation', action='store_true',
@@ -153,20 +190,33 @@ def main(argv=None) -> int:
     seeds = RL_SEEDS[:1] if args.quick else RL_SEEDS[:args.seeds]
     episodes = 200 if args.quick else args.episodes
 
+    wanted = {'both': None, 'equity': {'equity'}, 'credit': {'credit'}}[args.only]
     summaries = []
     main_summaries = []
     for setter in (equity_setting, credit_setting):
         setting = setter()
+        if wanted is not None and setting.name not in wanted:
+            continue
+        normalization = args.normalization
+        if setting.name == 'credit' and args.normalization_credit:
+            normalization = args.normalization_credit
         print(f'=== {setting.name}: {setting.market}', flush=True)
         summary = run_setting(setting, timesteps=timesteps, seeds=seeds, n_test=episodes,
                               train=not args.no_train,
-                              figure_tag='_quick' if args.quick else '')
+                              figure_tag=args.figure_tag or ('_quick' if args.quick else ''),
+                              normalization=normalization,
+                              save_models=args.save_models and not args.quick)
         summaries.append(summary)
         main_summaries.append(summary)
         unit = 'USD per 100-share lot per day' if setting.name == 'equity' \
             else 'USD per 1mm face lot per day'
         print(f'    exact discrete optimum J* = {summary["j_opt_discrete"]:.4f} raw units, '
               f'tuned constant depth = {summary["naive_depth"]:.4f}')
+        if 'headline' in summary:
+            print(f'    {summary["headline"]}')
+            scores = ' '.join(f'{100 * e:.1f}%'
+                              for e in summary['seed_dispersion']['per_seed_efficiency'])
+            print(f'    per seed efficiency: {scores}')
         print(format_summary_table(summary, unit))
         print('    paired against the optimum:')
         for row in summary['paired']:
@@ -178,10 +228,16 @@ def main(argv=None) -> int:
     if args.ablation:
         for setter in (equity_setting, credit_setting):
             setting = setter()
+            if wanted is not None and setting.name not in wanted:
+                continue
+            normalization = args.normalization
+            if setting.name == 'credit' and args.normalization_credit:
+                normalization = args.normalization_credit
             print(f'=== {setting.name} ablation: training on the fully realised PnL instead of '
-                  f'the variance reduced reward', flush=True)
+                  'the variance reduced reward', flush=True)
             summary = run_setting(setting, timesteps=timesteps, seeds=seeds, n_test=episodes,
-                                  train=True, noise_free=False, figures=False)
+                                  train=True, noise_free=False, figures=False,
+                                  normalization=normalization)
             summary['setting'] = f'{setting.name}_realised_pnl_reward'
             summaries.append(summary)
             unit = 'USD per 100-share lot per day' if setting.name == 'equity' \
@@ -189,12 +245,18 @@ def main(argv=None) -> int:
             print(format_summary_table(summary, unit), flush=True)
 
     if len(main_summaries) > 1:
-        plot_efficiency_bars(main_summaries, tag='_quick' if args.quick else '')
+        plot_efficiency_bars(main_summaries,
+                             tag=args.figure_tag or ('_quick' if args.quick else ''))
     RESULTS.mkdir(parents=True, exist_ok=True)
     payload = jsonable({'summaries': summaries,
                         'parameters': {s.name: parameter_table(s)
                                        for s in (equity_setting(), credit_setting())}})
-    out = RESULTS / ('summary_quick.json' if args.quick else 'summary.json')
+    if args.quick:
+        out = RESULTS / 'summary_quick.json'
+    elif args.only != 'both':
+        out = RESULTS / f'summary_{args.only}.json'
+    else:
+        out = RESULTS / 'summary.json'
     out.write_text(json.dumps(payload, indent=2))
     print(f'wrote {out}')
     return 0
