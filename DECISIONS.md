@@ -1,5 +1,7 @@
 # Decision log
 
+The benchmark this log describes, and the results it refers to, now live in the follow-on repository mm-rl-vs-optimum. This repository is archived.
+
 Every judgement call made while fixing the benchmark, rerunning it and packaging it, with the
 evidence behind it. Written after the fact from the runs themselves.
 
