@@ -11,25 +11,25 @@ is an Attn-LOB encoder (convolution and inception blocks plus multi-head attenti
 pretrained as a mid-price trend classifier, followed by a dense head. Two agents are available
 through TensorForce: PPO on a continuous action, and dueling DQN on a discrete action set.
 
-## Market-making benchmark: RL vs the known optimum (equity and credit RFQ)
+## Market-making benchmark: RL vs the known optimum (equity and corporate-bond RFQ)
 
 `benchmark/` is a self-contained, under twenty minute, laptop CPU benchmark that answers one
 question honestly: can an ordinary RL agent recover a market-making policy whose optimum is
 known exactly, and how much of the available edge does it capture? Nothing here needs the
 Shenzhen data, and nothing here depends on the reproduction below.
 
-It has two settings. Both are a single dealer with an inventory limit who posts a bid and an ask
-and is filled by a Poisson arrival process whose intensity decays with the distance of the quote
-from the mid:
+Two settings, both a single dealer with an inventory limit who posts a bid and an ask and is
+filled by a Poisson arrival process whose intensity decays with the distance of the quote from
+the mid:
 
 | | equity | credit |
 | --- | --- | --- |
-| story | one cash equity, arithmetic mid price, exponential fill intensity | one investment grade corporate bond, request-for-quote dealing, logistic hit ratio |
-| fill intensity fitting the classic model | `f(d) = exp(-k d)`, `k = 1.5` | `f(d) = 1 / (1 + exp(beta d))`, `beta = 100` |
-| known optimum | Cartea-Jaimungal closed form, and the discrete optimum below | no closed form, discrete optimum only |
-| parameters | Avellaneda-Stoikov (2008) numerical section | assumed, see the parameter table |
+| story | one cash equity, arithmetic mid price, exponential fill intensity | one corporate bond, request-for-quote dealing with a logistic hit ratio |
+| fill intensity | `f(d) = exp(-k d)`, `k = 1.5` | `f(d) = 1 / (1 + exp(alpha + beta d))` |
+| known optimum | Cartea-Jaimungal closed form, and the discrete optimum below | discrete optimum only, no closed form |
+| parameters | Avellaneda-Stoikov (2008) numerical section | calibrated in spread terms, see below |
 
-### What is "the known optimum" here, exactly
+### What "the known optimum" means here
 
 Three independent answers are computed, and the report shows all three so that a mistake in any
 one of them would be visible.
@@ -43,163 +43,194 @@ one of them would be visible.
    ```
 
    solved with an implicit Runge-Kutta integrator and an analytic Jacobian
-   (`benchmark/hjb.py`). For the exponential setting there is also the exact matrix-exponential
-   closed form, `h = (1/k) log w`, `w = expm(M (T-t)) z`, which the solver reproduces to 1e-9 at
-   every grid point.
+   (`benchmark/hjb.py`). For the exponential setting the exact matrix exponential closed form,
+   `h = (1/k) log w` with `w = expm(M (T-t)) z`, is available and the solver reproduces it to
+   1e-9 at every grid point.
 
 2. **The exact discrete optimum.** The simulator moves inventory at most one lot up and one lot
    down per step, so the expected objective satisfies a finite backward recursion on the grid of
-   `(step, inventory)` that can be solved exactly (`benchmark/dp.py`). Its value at an empty book
-   is the largest expected PnL any policy can achieve in the simulator, with no Monte Carlo error.
+   `(step, inventory)` that is solved exactly (`benchmark/dp.py`). Its value at an empty book is
+   the largest expected PnL any policy can achieve in the simulator, with no Monte Carlo error.
    This is the number the agent is graded against.
 
 3. **The optimal policy as a table.** Both of the above produce `d_ask` and `d_bid` for every
    cell of the `(time, inventory)` grid, which is what the simulator replays.
 
-Two things fell out of validating these against each other, and both are pinned by tests:
+Two properties of this problem fell out of cross-checking the three, and both are pinned by
+tests. First, **the floor at a zero depth changes the answer**: `H` maximises over `d >= 0`, and
+near the inventory limit the exact optimum quotes at the mid on the reducing side, where the
+exponential branch of `H` is outside its range. The textbook closed form solves the
+corresponding unfloored system, so it agrees with the exact solution to a few hundredths of a
+price unit near a flat book and differs by tens of units near the inventory limit. Second, **the
+continuous-time and discrete optima differ slightly**: the exact discrete optimum is what is
+graded, and the HJB policy lands a fraction of a percent below it, mostly because the exact
+one-step fill probability `1 - exp(-lam f dt)` is smaller than the intensity `lam f dt`.
 
-* **The floor at a zero depth matters, so the textbook closed form is not the answer.** `H`
-  maximises over `d >= 0`. With these parameters, an inventory near the limit makes the price of
-  inventory risk more negative than `-1/k`, so the exact optimum quotes at the mid on the
-  reducing side, where the exponential branch of `H` is outside its range. The closed form solves
-  the corresponding unfloored system: it agrees with the exact solution to a few hundredths of a
-  price unit near a flat book and differs by tens of units near the inventory limit
-  (`tests/test_hjb.py::test_floor_at_zero_depth_separates_exact_solution_from_closed_form`).
-  The optimum used everywhere below is the floored one.
-* **The continuous-time optimum and the discrete optimum are close but not equal.** The exact
-  discrete optimum is `J*_discrete`, and the HJB policy achieves `J_HJB`, a fraction of a percent
-  below it. The difference is a discretisation effect, mostly because the exact one-step fill
-  probability `1 - exp(-lam f dt)` is smaller than the intensity `lam f dt` that the ODE uses.
-  The grader is `J*_discrete`; `J_HJB` is reported next to it.
+### The credit setting in dealer terms
+
+One lot is 1mm of face value and the price is quoted per 100 of face, so one price point on one
+lot is 10,000 USD. Modified duration `D = 7` gives a DV01 of 700 USD per lot per basis point,
+which puts one basis point of spread at 0.07 price points.
+
+Worked example, inputs and outputs labelled:
+
+```
+inputs:  D = 7, target half-spread = 2.5 bp
+output:  price half-spread = D * 0.00025 * 100 = 7 * 0.00025 * 100 = 0.175 points
+         in dollars = 0.175 * 10,000 = 1,750 USD of spread on one 1mm lot
+```
+
+The dealer faces about 10 requests per side per day, quotes a two-way price, and is filled on a
+side with probability `f(d)` where `d` is the distance of that quote from the mid. Holding one
+lot for a whole day costs `0.5 gamma sigma^2 T`, which is set to 2.25 times the 1,750 USD of
+spread earned on a single fill, so inventory risk is a first-order concern: the solving policy
+keeps the inventory within plus or minus two lots and quotes widely on the side that would
+worsen a position.
+
+The hit-ratio parameters are not guessed. They are solved so that the dynamic program quotes
+exactly the 2.5 basis point half-spread at `(t = 0, q = 0)` and the hit ratio at that depth is
+30 percent, and `tests/test_benchmark.py` re-checks both targets.
 
 ### Evaluation protocol
 
 * The tuned baseline is the best **constant** quote depth, chosen on separate tuning episodes
   and never on the test episodes.
 * Every headline number is produced on 2000 held out episodes with **common random numbers**, so
-  strategies are compared on the same price shocks and the same fill draws. Differences are then
-  estimated far more precisely than the individual means.
+  strategies are compared on the same price shocks and the same fill draws.
 * The headline score is `efficiency = (J_strategy - J_naive) / (J_optimum - J_naive)`, the
   fraction of the gap between a tuned constant quote and the exact optimum that a strategy closes.
-* The RL entry is an ensemble of five seeds: its reported per-episode value is the average over
-  the five policies, which is exactly the value of the mixed policy that picks a seed uniformly.
+* Five training seeds per setting. Every headline efficiency is the 5-seed mean plus or minus the
+  standard deviation across seeds, with the worst and best seeds reported as well. In the credit
+  setting one seed in five collapses to a policy that barely trades, which is visible in the
+  worst seed column and is a consequence of the sparse fill signal rather than a bug.
 * The agent must not beat the optimum beyond sampling error. `run_all.py` prints a paired test of
   every strategy against the optimal policy, so a violation would be visible rather than averaged
   away.
+* **The optimum is never visible to the training loop.** No reward scaling, callback, stopping
+  rule or hyperparameter uses the optimum, the dynamic program or the HJB solution: those appear
+  only in evaluation, reporting and tests, and
+  `tests/test_benchmark.py::test_training_cannot_see_the_optimum` enforces that by parsing the
+  trainer and the environment. Reward size during training is controlled either by
+  stable-baselines3 reward normalization (`VecNormalize` with `norm_obs=False`,
+  `norm_reward=True`, statistics saved next to the agent) or by a fixed constant derived from
+  the fill model, `1 / (lam * T * d_foc)` where `d_foc` solves the fill model's own first-order
+  condition at a zero price of inventory risk. Both are functions of model inputs only.
 
 ### Results
 
+PPO recovers 91.0% +/- 2.4% (worst seed 87.6%) of the optimal policy's improvement over a tuned constant quote.
+
+Equity setting, variance reduced reward:
+
 | strategy | mean PnL (USD per 100 share lot per day) | 95% CI | PnL / std | efficiency | paired minus optimum | mean abs end of day q | fills per day |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **exact optimum** (dynamic program) | 5832.6 | +-32.3 | 7.90 | 0.993 | n/a | 0.89 | 80.2 |
-| HJB solver policy | 5802.7 | +-31.3 | 8.13 | 0.974 | -29.9 +- 11.2 | 0.94 | 88.4 |
-| textbook closed-form policy | 5801.8 | +-31.3 | 8.12 | 0.973 | -30.8 +- 11.2 | 0.96 | 88.4 |
-| Avellaneda-Stoikov heuristic | 5494.2 | +-29.2 | 8.25 | 0.775 | -338.4 +- 21.1 | 2.28 | 85.3 |
-| **RL**, PPO, mean of 5 seeds | 5588.7 | +-29.0 | 8.44 | 0.836 | -243.9 +- 12.6 | 1.81 | 61.3 |
-| RL, worst of the 5 seeds | 5189.3 | +-40.9 | 5.56 | 0.578 | -643.3 +- 35.6 | 0.82 | 79.9 |
-| tuned constant quote (baseline) | 4294.9 | +-103.5 | 1.82 | 0.000 | -1537.7 +- 97.2 | 5.89 | 66.2 |
-| deep fixed quote | 2290.8 | +-43.0 | 2.34 | -1.295 | -3541.8 +- 44.9 | 2.89 | 13.5 |
+| `dp_optimal` exact optimum (dynamic program) | 5832.6 | +-32.3 | 7.90 | 0.993 | n/a | 0.89 | 80.2 |
+| `hjb_optimal` HJB solver policy | 5802.7 | +-31.3 | 8.13 | 0.974 | -29.9 +- 11.2 | 0.94 | 88.4 |
+| `closed_form_cartea_jaimungal` textbook closed form | 5801.8 | +-31.3 | 8.12 | 0.973 | -30.8 +- 11.2 | 0.96 | 88.4 |
+| `avellaneda_stoikov` Avellaneda-Stoikov heuristic | 5494.2 | +-29.2 | 8.25 | 0.775 | -338.4 +- 21.1 | 2.28 | 85.3 |
+| `rl` RL, PPO, 5-seed mean | 5703.9 | +-31.2 | 8.02 | 0.910 | -128.7 +- 10.0 | 1.84 | 77.8 |
+| `rl_best_seed` RL, best of the 5 seeds | 5748.1 | +-34.9 | 7.21 | 0.939 | -84.5 +- 14.7 | 1.84 | 77.8 |
+| `rl_worst_seed` RL, worst of the 5 seeds | 5650.7 | +-32.8 | 7.54 | 0.876 | -181.9 +- 18.5 | 1.78 | 69.6 |
+| `naive_tuned` tuned constant quote (baseline) | 4294.9 | +-103.5 | 1.82 | 0.000 | -1537.7 +- 97.2 | 5.89 | 66.2 |
+| `constant_deep` deep fixed quote | 2290.8 | +-43.0 | 2.34 | -1.295 | -3541.8 +- 44.9 | 2.89 | 13.5 |
+
+The Avellaneda-Stoikov heuristic approximates the optimum of a different objective, exponential
+utility rather than the quadratic inventory penalty used here, so its lower score is not a case
+of RL beating it.
+
+PPO recovers 56.6% +/- 34.2% (worst seed -0.7%) of the optimal policy's improvement over a tuned constant quote.
+
+Credit setting, variance reduced reward:
 
 | strategy | mean PnL (USD per 1mm face lot per day) | 95% CI | PnL / std | efficiency | paired minus optimum | mean abs end of day q | fills per day |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **exact optimum** (dynamic program) | 1877.1 | +-108.8 | 0.76 | 0.996 | n/a | 0.23 | 16.8 |
-| HJB solver policy | 1878.1 | +-109.5 | 0.75 | 0.996 | +1.1 +- 14.9 | 0.25 | 17.0 |
-| **RL**, PPO, mean of 5 seeds | 1536.9 | +-76.5 | 0.88 | 0.812 | -340.1 +- 61.2 | 0.52 | 17.4 |
-| RL, worst of the 5 seeds | 1274.3 | +-113.3 | 0.49 | 0.670 | -602.8 +- 111.6 | 0.45 | 10.2 |
-| tuned constant quote (baseline) | 35.2 | +-58.8 | 0.03 | 0.000 | -1841.9 +- 118.8 | 0.44 | 0.6 |
-| deep fixed quote | 42.1 | +-38.6 | 0.05 | 0.004 | -1834.9 +- 113.1 | 0.21 | 0.2 |
+| `dp_optimal` exact optimum (dynamic program) | 4751.3 | +-185.8 | 1.12 | 0.977 | n/a | 0.23 | 5.4 |
+| `hjb_optimal` HJB solver policy | 4754.1 | +-185.5 | 1.12 | 0.977 | +2.8 +- 20.4 | 0.24 | 5.5 |
+| `rl` RL, PPO, 5-seed mean | 2751.6 | +-112.1 | 1.08 | 0.566 | -1999.7 +- 119.7 | 0.31 | 3.5 |
+| `rl_best_seed` RL, best of the 5 seeds | 4203.1 | +-170.3 | 1.08 | 0.864 | -548.2 +- 120.2 | 0.29 | 5.3 |
+| `rl_worst_seed` RL, worst of the 5 seeds | -33.3 | +-18.5 | -0.08 | -0.007 | -4784.6 +- 186.7 | 0.02 | 0.0 |
+| `naive_tuned` tuned constant quote (baseline) | -0.8 | +-13.5 | -0.00 | 0.000 | -4752.2 +- 186.2 | 0.02 | 0.0 |
+| `constant_deep` deep fixed quote | 5.3 | +-7.7 | 0.03 | 0.001 | -4746.0 +- 185.7 | 0.01 | 0.0 |
 
-| setting | reward used in training | RL efficiency | RL mean PnL |
-| --- | --- | --- | --- |
-| equity | variance reduced (default) | 0.836 | 5588.7 |
-| equity | fully realised PnL | 0.828 | 5576.6 |
-| credit | variance reduced (default) | 0.812 | 1536.9 |
-| credit | fully realised PnL | 0.397 | 770.0 |
+In the credit setting a tuned constant quote earns roughly nothing after inventory costs, so efficiency here is the share of the optimal policy's profit that RL captures.
 
-Figures are written to `figures/`: optimal depths against inventory for both solvers,
-end of day inventory distributions, learning curves against the optimum, a sample episode, and
-the efficiency bars.
+RL settings, applied identically to both settings: PPO with a 64 by 64 MLP, `n_steps` 512,
+`batch_size` 256, `n_epochs` 10, learning rate 3e-4, `gamma` 1.0, `gae_lambda` 0.95,
+`ent_coef` 0.001, `log_std_init` -1.0, 500,000 timesteps per seed and five seeds.
+
+The table below isolates one design choice: replacing the realised marking term with its
+conditional mean during training. The removed term is a martingale increment independent of the
+fills, so its expectation is zero under every policy and it cannot move the optimum, but it is
+larger than the spread earned per step, which is what makes it worth removing where the spread
+is small next to the price risk of a position. In this calibration the effect is modest and
+uniform: the 5-seed mean efficiency moves from 0.875 to 0.910 for equity and from 0.530 to 0.566
+for credit. In an earlier, much wider-spread credit calibration the same change moved credit from
+0.397 to 0.812, which bounds how much of the effect belongs to reward noise in general.
+
+Equity setting, fully realised reward:
+
+| strategy | mean PnL (USD per 100 share lot per day) | 95% CI | PnL / std | efficiency | paired minus optimum | mean abs end of day q | fills per day |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `rl` RL, PPO, 5-seed mean | 5649.9 | +-30.8 | 8.03 | 0.875 | n/a | 1.80 | 78.0 |
+
+Credit setting, fully realised reward:
+
+| strategy | mean PnL (USD per 1mm face lot per day) | 95% CI | PnL / std | efficiency | paired minus optimum | mean abs end of day q | fills per day |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `rl` RL, PPO, 5-seed mean | 2575.8 | +-110.3 | 1.02 | 0.530 | n/a | 0.34 | 5.9 |
+
+Figures are written to `figures/`: optimal depths against inventory for both solvers, end of day
+inventory distributions, learning curves against the optimum, a sample episode and the
+efficiency bars.
 
 ### Parameters, with units and provenance
 
-| parameter | equity | credit | unit | source |
-| --- | --- | --- | --- | --- |
-| `s0` | 100.0 | 100.0 | price (one share) | equity: Avellaneda and Stoikov (2008); credit: par bond, ASSUMED |
-| `sigma` | 2.0 | 0.25 | price units per unit time | equity: Avellaneda and Stoikov (2008). credit: ASSUMED, duration about 5 years times a daily yield move of about 5 bp gives 0.25 per 100 of face |
-| `T` | 1.0 | 1.0 | time | equity: as in the paper. credit: one trading day |
-| `dt` | 0.005 | 0.005 | time | equity: as in the paper. credit: same discretisation |
-| `n_steps` | 200 | 200 | steps | T / dt |
-| `lam` | 140.0 | 50.0 | arrivals per unit time | equity: Avellaneda and Stoikov (2008) A = 140. credit: ASSUMED, 50 requests per side per day for one liquid investment grade bond |
-| `Q` | 20 | 10 | lots | chosen so the bound rarely binds; tests and the README report the fraction of time at the bound |
-| `gamma` | 0.1 | 1.0 | risk aversion | equity: Avellaneda and Stoikov (2008) numerical section. credit: chosen so that 0.5 gamma sigma^2 T, the cost of holding one lot for the whole day, is about 2.25 times the spread earned on one fill; see the class docstring for credit_setting |
-| `phi` | 0.2 | 0.03125 | price per unit time per lot^2 | derived: 0.5 * gamma * sigma^2 |
-| `a` | 0.2 | 0.03125 | price per lot^2 | derived: phi * T, so ending with q lots costs the same as holding q lots for the whole horizon |
-| `usd_per_price_unit` | 100.0 | 10000.0 | USD | reporting only, it never enters the dynamics. equity: one unit of inventory is one share, reported per 100 share lot. credit: one lot is one million of face, quoted per 100 of face, so one price unit is 10000 USD per lot |
-| `d_max` | 2.0 | 0.06 | price units | RL action bound. Quoting inside this bound is worth within 0.001 percent of the unbounded optimum (see tests/test_benchmark.py and the README table), and it puts the optimal depth near a third of the action range so that exploration covers the region that matters |
-| `k` | 1.5 |  | 1 / price | Avellaneda and Stoikov (2008) |
-| `alpha` |  | 0.0 | dimensionless | ASSUMED, gives a hit ratio of 0.5 at a zero half-spread |
-| `beta` |  | 100.0 | 1 / price unit | ASSUMED. beta sets the optimal half-spread through the first order condition beta (1 - f) d = 1, so beta = 100 puts the optimal half-spread near 1.4 cents per 100 of face, i.e. 1.4 basis points, with a hit ratio near 0.20, the order of magnitude reported for liquid investment grade dealer-to-client RFQ activity |
+PARAMETER_TABLE
 
-Anything marked ASSUMED is a choice, not a measurement. The two that carry the most weight are
-the credit hit-ratio slope `beta` and the risk aversion `gamma`: `beta` sets the optimal
-half-spread through the first order condition `beta (1 - f(d)) d = 1`, and `gamma` sets how much
-inventory risk costs. `gamma` for credit is chosen so that holding one lot for a whole day costs
-about 2.25 times the spread earned on a single fill, which is what makes inventory control
-worth modelling in that setting; with a smaller value the optimal policy becomes nearly
-inventory-blind and a constant quote almost matches it, which would make the benchmark
-uninformative.
+Anything marked ASSUMED is a choice rather than a measurement. Two of them carry the most
+weight: the credit spread volatility of 4 bp per day, and the 10 requests per side per day.
 
 ### Design choices, and the honest list
 
 * **The RL action space is `[0, d_max]^2`, and `d_max` is tight on purpose.** The unconstrained
-  optimum wants very deep quotes at the inventory limit near the close (up to 8.5 price units for
-  equity). Solving the same problem with a bound four times wider changes the optimum by less
-  than 0.001 percent for equity and 0.02 percent for credit, so the bound is not the binding
-  constraint on the answer, but it does make exploration cover the region that matters. Both
-  numbers are asserted in `tests/test_benchmark.py::test_the_action_bound_is_almost_free`. The
-  agent is graded against the exact optimum **of its own bounded problem**.
-* **The marking noise is removed from the training reward, not from the reported PnL.** The
-  realised step reward contains `q_{k+1} (S_{k+1} - S_k)`, a martingale increment independent of
-  the fills. Its expectation is zero under every policy and it is larger than the spread earned
-  per step, so it adds no information about the policy while dominating the learning signal. The
-  default environment replaces `S_{k+1}` with its conditional mean, which makes the expected step
-  reward exactly the expression the dynamic program optimises. Reported PnL for every strategy
-  comes from the full simulator, price shocks included. `run_all.py --ablation` trains on the
-  fully realised reward for comparison; the second table below shows what it costs. The variance reduction is worth little in the equity setting (efficiency 0.828 against 0.836) and a great deal in the credit setting (0.397 against 0.812), because the credit spread earned per fill is small next to the daily price risk of one lot.
+  optimum wants very deep quotes at the inventory limit near the close. Solving the same problem
+  with a bound four times wider changes the optimum by less than 0.0001 percent for
+  equity and 0.0039 percent for credit, so the bound is not the binding constraint on
+  the answer, but it does make exploration cover the region that matters. Both numbers are
+  asserted in `tests/test_benchmark.py`. The agent is graded against the exact optimum **of its
+  own bounded problem**.
 * **The mid price is a martingale, so it cannot move the expected objective, only the dispersion.**
   With fills independent of the price path and a policy that does not condition on the price, the
   level of `S` enters the objective linearly and cancels. A test checks that the optimum is
-  unchanged when `sigma` is set to zero. The price shocks matter for the reported PnL dispersion
-  and for the noise in the learning signal, which is why they are kept.
+  unchanged when `sigma` is set to zero.
 * **At most one fill per side per step.** The one-step fill probability is the exact probability
-  of at least one Poisson event, `1 - exp(-lam f dt)`, which understates the fill count by
-  `O((lam f dt)^2)` relative to an event-driven simulation. At the equity parameters that is
-  about 11 percent of fills at the open. Inventory, cash and the depth trade-off are unaffected
-  in expectation.
+  of at least one Poisson event, which understates the fill count by `O((lam f dt)^2)` relative to
+  an event-driven simulation. At the equity parameters that is about 11 percent of fills at the
+  open.
 * **The observation is `(t / T, q / Q)`.** That is not a shortcut: the optimal policy is a
   function of time and inventory only, in both settings, because the mid price enters the value
   function linearly. The agent therefore has every feature the optimum uses, and no strategy is
   given a feature another does not get.
-* **One hyperparameter needed a decision.** The initial exploration width `log_std_init = -1.0`
-  instead of the stable-baselines3 default of 0. At the default, sampled actions span the whole
-  action box, which for credit means almost every sample is a quote too deep to trade and the
-  agent receives almost no signal; on two seeds, 300k steps, credit efficiency was 0.43 and 0.59
-  at the default and 0.94 and 0.78 at `-1.0`. Everything else is stock PPO.
+* **What the credit setting cannot show.** With about 5.4 fills per day the learning
+  signal is sparse, so what the credit result measures is how much of the available edge a plain
+  PPO recovers from a few thousand episodes, not what an optimised implementation could do.
+* **No data.** Both settings are synthetic models with constant volatility and no adverse
+  selection: fills depend only on the distance of the quote, so there is no informed counterparty
+  and no queue position. The benchmark measures whether RL can learn a known policy, not whether
+  that policy would make money in a real market.
 
 ### Reproduce
 
 ```bash
 pip install -r benchmark/requirements.txt
-python -m benchmark.run_all               # full run, about 20 minutes on a MacBook CPU
-python -m benchmark.run_all --quick       # smoke run, about a minute
-pytest benchmark/tests                    # 33 tests, about 2.5 minutes with the slow ones
+python -m benchmark.run_all --ablation --save-models   # full run, about 35 minutes
+python -m benchmark.run_all --quick                    # smoke run, about a minute
+python check_readme.py                                 # README against the recorded results
+pytest benchmark/tests                                 # 36 tests
 ```
 
 `benchmark/results/summary.json` holds every number that produced the tables above, including the
-per-seed objectives, the tuning sweep and the paired tests.
-
-
-Wall clock for the whole run, including training, evaluation and figures: 18.7 minutes on an Apple Silicon MacBook CPU, single process, no GPU.
+per-seed efficiencies, the tuning sweep and the paired tests.
 
 ## Read this first: what is NOT in this repository
 
